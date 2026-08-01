@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scic-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Ready-to-use interactive shell client for SCIC Framework applications"
 readme = "README.md"
 license = "MIT"
