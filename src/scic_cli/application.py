@@ -8,10 +8,12 @@ from collections.abc import Callable
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 
 from .completion import SCICCompleter
 from .config import CLIConfig
+from .diagnostics import build_diagnostic
 from .errors import CommandError
 from .protocols import SCICProtocol, SCICSessionProtocol
 from .renderer import ResultRenderer
@@ -44,13 +46,20 @@ class SCICCLI:
     def run(self) -> int:
         """Run the interactive shell from synchronous application code."""
         try:
-            asyncio.get_running_loop()
+            running_loop = asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.run_async())
-        raise RuntimeError(
-            "SCICCLI.run() cannot be called inside a running event loop; "
-            "use 'await cli.run_async()'."
-        )
+            running_loop = None
+
+        if running_loop is not None:
+            raise RuntimeError(
+                "SCICCLI.run() cannot be called inside a running event loop; "
+                "use 'await cli.run_async()'."
+            )
+
+        # Do not call asyncio.run() from inside the RuntimeError handler above.
+        # Doing so keeps that exception as active context and causes unrelated
+        # command failures to show a misleading "no running event loop" chain.
+        return asyncio.run(self.run_async())
 
     async def run_async(self) -> int:
         """Run the interactive shell until the user exits."""
@@ -61,7 +70,7 @@ class SCICCLI:
         while self._running:
             try:
                 instruction = await self._prompt_session.prompt_async(
-                    self._prompt_text()
+                    self._prompt()
                 )
             except EOFError:
                 break
@@ -78,9 +87,30 @@ class SCICCLI:
             except (KeyboardInterrupt, asyncio.CancelledError):
                 self.renderer.print_info("Operation cancelled.")
             except Exception as error:
-                self.renderer.print_error(error)
-                if self.config.show_tracebacks:
-                    self.renderer.console.print(traceback.format_exc())
+                diagnostic = build_diagnostic(
+                    error,
+                    instruction=instruction,
+                    session=self.session,
+                    tree=self._export_tree_safely(),
+                )
+                print_diagnostic = getattr(
+                    self.renderer,
+                    "print_diagnostic",
+                    None,
+                )
+                if callable(print_diagnostic):
+                    print_diagnostic(diagnostic)
+                else:
+                    # Compatibility with custom 0.1.x renderers.
+                    self.renderer.print_error(error)
+
+                if self.config.debug:
+                    formatted_traceback = traceback.format_exc()
+                    console = getattr(self.renderer, "console", None)
+                    if console is not None:
+                        console.print(formatted_traceback)
+                    else:
+                        print(formatted_traceback)
 
         self._running = False
         return 0
@@ -112,6 +142,13 @@ class SCICCLI:
 
     def stop(self) -> None:
         self._running = False
+
+    def _export_tree_safely(self) -> dict[str, Any] | None:
+        """Avoid masking the original failure if metadata export also fails."""
+        try:
+            return self.scic.export_tree()
+        except Exception:
+            return None
 
     def _builtin_handlers(self) -> dict[str, Callable[[list[str]], Any]]:
         return {
@@ -171,8 +208,39 @@ class SCICCLI:
         self._require_count(arguments, 0, "exit")
         self.stop()
 
+    def _display_context_path(self) -> str:
+        context_path = self.session.context_path.strip("/")
+        parts = context_path.split("/") if context_path else []
+
+        if self.config.root_text:
+            if parts:
+                parts[0] = self.config.root_text
+            else:
+                parts.append(self.config.root_text)
+
+        return "/".join(parts)
+
+    def _prompt(self) -> FormattedText:
+        root_style = ""
+        prompt_style = ""
+        if self.config.enable_colors:
+            if self.config.root_color:
+                root_style = f"fg:{self.config.root_color}"
+            if self.config.prompt_color:
+                prompt_style = f"fg:{self.config.prompt_color}"
+
+        return FormattedText(
+            [
+                (root_style, self._display_context_path()),
+                ("", " "),
+                (prompt_style, self.config.prompt_text),
+                ("", " "),
+            ]
+        )
+
     def _prompt_text(self) -> str:
-        return f"{self.session.context_path} {self.config.prompt_symbol} "
+        """Return the plain prompt, retained for 0.1.x integrations."""
+        return f"{self._display_context_path()} {self.config.prompt_text} "
 
     def _create_prompt_session(self) -> PromptSession:
         history = InMemoryHistory()
@@ -193,4 +261,7 @@ class SCICCLI:
     @staticmethod
     def _require_count(arguments: list[str], expected: int, usage: str) -> None:
         if len(arguments) != expected:
-            raise CommandError(f"Usage: {usage}")
+            raise CommandError(
+                f"Expected {expected} argument(s), received {len(arguments)}.",
+                usage=usage,
+            )

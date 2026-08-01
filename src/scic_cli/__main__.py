@@ -33,10 +33,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("application", help="Import specification: module:object")
     parser.add_argument("--name", default="SCIC", help="Application display name")
+    parser.add_argument("--root-text", help="Root label shown in the prompt")
+    parser.add_argument("--root-color", default="ansicyan", help="Root foreground color")
+    parser.add_argument("--prompt-text", default=">", help="Prompt marker text")
+    parser.add_argument("--prompt-color", default="ansigreen", help="Prompt foreground color")
     parser.add_argument("--no-banner", action="store_true")
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument("--no-completion", action="store_true")
-    parser.add_argument("--tracebacks", action="store_true")
+    parser.add_argument(
+        "--debug",
+        "--tracebacks",
+        dest="debug",
+        action="store_true",
+        help="Show technical tracebacks for debugging.",
+    )
     return parser
 
 
@@ -46,10 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         scic = load_scic(arguments.application)
         config = CLIConfig(
             application_name=arguments.name,
+            root_text=arguments.root_text,
+            root_color=arguments.root_color,
+            prompt_text=arguments.prompt_text,
+            prompt_color=arguments.prompt_color,
             show_banner=not arguments.no_banner,
             enable_history=not arguments.no_history,
             enable_completion=not arguments.no_completion,
-            show_tracebacks=arguments.tracebacks,
+            debug=arguments.debug,
         )
         return SCICCLI(scic, config=config).run()
     except Exception as error:

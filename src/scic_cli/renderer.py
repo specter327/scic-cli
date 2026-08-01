@@ -7,11 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich import box
 from rich.json import JSON
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+
+from .errors import ErrorDiagnostic
+from .schema import describe_contract
 
 
 class ResultRenderer:
@@ -35,7 +39,7 @@ class ResultRenderer:
         if len(results) == 1:
             self.print_value(results[0])
             return
-        table = Table(title="Results", show_lines=True)
+        table = self._table(title="Results")
         table.add_column("#", justify="right")
         table.add_column("Value")
         for index, value in enumerate(results):
@@ -55,14 +59,22 @@ class ResultRenderer:
         if not entries:
             self.console.print("[dim]Context is empty.[/dim]")
             return
-        table = Table(show_header=True, header_style="bold")
+        table = self._table()
         table.add_column("Type", width=12)
         table.add_column("Name")
         table.add_column("Description")
         for entry in entries:
             kind = entry.get("type", "unknown")
-            marker = "context" if kind == "context" else "function"
-            table.add_row(marker, str(entry.get("name", "")), str(entry.get("description") or ""))
+            marker = (
+                Text("context", style="bold blue")
+                if kind == "context"
+                else Text("function", style="green")
+            )
+            table.add_row(
+                marker,
+                Text(str(entry.get("name", ""))),
+                Text(str(entry.get("description") or "")),
+            )
         self.console.print(table)
 
     def print_description(self, description: dict[str, Any]) -> None:
@@ -72,7 +84,12 @@ class ResultRenderer:
             lines.append(str(description["description"]))
         if description.get("path"):
             lines.append(f"Path: {str(description['path']).lstrip('/')}")
-        self.console.print(Panel("\n".join(lines) or "No description.", title=title))
+        self.console.print(
+            Panel(
+                Text("\n".join(lines) or "No description."),
+                title=Text(title),
+            )
+        )
 
         if description.get("type") == "executable":
             self._print_contract("Parameters", description.get("parameters", []))
@@ -90,7 +107,7 @@ class ResultRenderer:
         self.console.print(root)
 
     def print_help(self) -> None:
-        table = Table(title="Shell commands", show_lines=False)
+        table = self._table(title="Shell commands")
         table.add_column("Command", style="bold")
         table.add_column("Description")
         commands = (
@@ -111,39 +128,110 @@ class ResultRenderer:
         self.console.print(table)
 
     def print_error(self, error: BaseException) -> None:
+        """Render a legacy, unstructured error."""
         message = str(error) or error.__class__.__name__
         self.console.print(f"[bold red]{error.__class__.__name__}:[/bold red] {message}")
         details = getattr(error, "details", None)
         if details:
             self.print_value(details)
 
+    def print_diagnostic(self, diagnostic: ErrorDiagnostic) -> None:
+        """Render an actionable explanation without exposing a traceback."""
+        body = Text(diagnostic.message)
+
+        if diagnostic.instruction:
+            body.append("\nInstruction: ", style="bold")
+            body.append(diagnostic.instruction, style="cyan")
+
+        if diagnostic.code == "invalid_parameter":
+            name = diagnostic.details.get("name")
+            index = diagnostic.details.get("index")
+            value = diagnostic.details.get("value")
+            if name is not None:
+                body.append("\nParameter: ", style="bold")
+                body.append(str(name))
+            if index is not None:
+                body.append("\nPosition: ", style="bold")
+                body.append(str(index))
+            if value is not None:
+                body.append("\nReceived: ", style="bold")
+                body.append(str(value))
+
+        self.console.print(
+            Panel(
+                body,
+                title=diagnostic.title,
+                border_style="red",
+            )
+        )
+
+        if diagnostic.usage:
+            self.console.print("[bold]Usage[/bold]")
+            self.console.print(Text(f"  {diagnostic.usage}", style="cyan"))
+
+        if diagnostic.executable is not None:
+            self._print_contract(
+                "Parameters",
+                diagnostic.executable.get("parameters", []),
+            )
+
+        if diagnostic.suggestions:
+            self.console.print("[bold]Did you mean?[/bold]")
+            for suggestion in diagnostic.suggestions:
+                self.console.print(Text(f"  {suggestion}", style="cyan"))
+
+        if not diagnostic.expected:
+            self.console.print(
+                "[dim]This appears to be an application error. "
+                "Run with --debug for the technical traceback.[/dim]"
+            )
+
     def print_info(self, message: str) -> None:
         self.console.print(f"[cyan]{message}[/cyan]")
 
     def _print_contract(self, title: str, schemas: list[dict[str, Any]]) -> None:
-        table = Table(title=title)
+        contract = describe_contract(
+            schemas,
+            item_label="parameter" if title == "Parameters" else "result",
+        )
+        table = self._table(title=title)
         table.add_column("#", justify="right")
         table.add_column("Name")
-        table.add_column("Type")
-        table.add_column("Constraints")
-        if not schemas:
-            table.add_row("-", "-", "-", "None")
-        for index, schema in enumerate(schemas):
-            data_type = schema.get("data_type") or schema.get("type") or "unknown"
-            name = schema.get("name") or f"value_{index}"
-            constraints = {
-                key: value
-                for key, value in schema.items()
-                if key not in {"name", "data_type", "type", "value"}
-                and value not in (None, [], {}, ())
-            }
-            table.add_row(str(index), str(name), str(data_type), self._renderable_text(constraints))
+        table.add_column("Expected type")
+        table.add_column("Description", ratio=2)
+        table.add_column("Characteristics", ratio=2)
+        if not contract:
+            table.add_row("-", "-", "-", "None declared.", "-")
+        for index, schema in enumerate(contract):
+            table.add_row(
+                str(index),
+                Text(schema.name),
+                Text(schema.data_type),
+                Text(schema.description or "-"),
+                Text("\n".join(schema.characteristics) or "-"),
+            )
         self.console.print(table)
+
+    @staticmethod
+    def _table(*, title: str | None = None) -> Table:
+        """Create a compact table without heavy header or outer borders."""
+        return Table(
+            title=title,
+            box=box.SIMPLE_HEAD,
+            show_edge=False,
+            pad_edge=False,
+            header_style="bold",
+            collapse_padding=True,
+        )
 
     def _build_tree(self, node: dict[str, Any]) -> Tree:
         kind = node.get("type", "resource")
-        icon = "[bold blue]context[/bold blue]" if kind == "context" else "[green]function[/green]"
-        label = f"{icon} {node.get('name', '')}"
+        label = Text()
+        label.append(
+            "context" if kind == "context" else "function",
+            style="bold blue" if kind == "context" else "green",
+        )
+        label.append(f" {node.get('name', '')}")
         tree = Tree(label)
         for child in node.get("children", []) or []:
             tree.add(self._build_tree(child))
